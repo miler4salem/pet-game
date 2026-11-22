@@ -1,35 +1,44 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { PawPrint, Plus } from 'lucide-react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { BookOpen, FastForward, Pause, Play, Plus, User } from 'lucide-react';
 import { SPECIES_MAP } from './data/species';
 import {
-  ActionEffectType,
   NeedDefinition,
   PetInstance,
+  PlayerGender,
   SpeciesId,
 } from './types/pet';
+import { GameCanvas, GameCanvasHandle } from './components/GameCanvas';
 import { AdoptionScreen } from './components/AdoptionScreen';
-import { CareDashboard } from './components/CareDashboard';
+import { CareGuideModal } from './components/CareGuideModal';
 
-const STORAGE_KEY = 'paws_claws_sanctuary_v1';
+const STORAGE_KEY = 'paws_claws_home_v2';
 
 interface SavedState {
   pets: PetInstance[];
   activePetId: string | null;
+  gender: PlayerGender;
+}
+
+interface ToastItem {
+  id: number;
+  text: string;
+  tone: 'default' | 'success' | 'warn';
 }
 
 function loadSavedState(): SavedState {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return { pets: [], activePetId: null };
-    const parsed = JSON.parse(raw) as SavedState;
-    if (!Array.isArray(parsed.pets)) return { pets: [], activePetId: null };
-    // Filter out any invalid species just in case
-    const validPets = parsed.pets.filter((p) => Boolean(SPECIES_MAP[p.speciesId]));
+    const raw = localStorage.getItem(STORAGE_KEY) || localStorage.getItem('paws_claws_sanctuary_v1');
+    if (!raw) return { pets: [], activePetId: null, gender: 'female' };
+    const parsed = JSON.parse(raw) as Partial<SavedState>;
+    const validPets = Array.isArray(parsed.pets)
+      ? parsed.pets.filter((p) => Boolean(SPECIES_MAP[p.speciesId]))
+      : [];
     const activeId =
       validPets.find((p) => p.id === parsed.activePetId)?.id ?? validPets[0]?.id ?? null;
-    return { pets: validPets, activePetId: activeId };
+    const gender: PlayerGender = parsed.gender === 'male' ? 'male' : 'female';
+    return { pets: validPets, activePetId: activeId, gender };
   } catch {
-    return { pets: [], activePetId: null };
+    return { pets: [], activePetId: null, gender: 'female' };
   }
 }
 
@@ -37,98 +46,97 @@ function clamp(val: number, min = 0, max = 100): number {
   return Math.max(min, Math.min(max, val));
 }
 
+function getBondLevel(xp: number): { level: number; title: string } {
+  const tiers = [
+    { min: 0, title: 'New Pal' },
+    { min: 60, title: 'Buddy' },
+    { min: 160, title: 'Close Friend' },
+    { min: 320, title: 'Best Friend' },
+    { min: 520, title: 'Soulmate' },
+  ];
+  let idx = 0;
+  for (let i = 0; i < tiers.length; i++) {
+    if (xp >= tiers[i].min) idx = i;
+  }
+  return { level: idx + 1, title: tiers[idx].title };
+}
+
 export const App: React.FC = () => {
   const initial = loadSavedState();
   const [pets, setPets] = useState<PetInstance[]>(initial.pets);
   const [activePetId, setActivePetId] = useState<string | null>(initial.activePetId);
+  const [gender, setGender] = useState<PlayerGender>(initial.gender);
   const [isAdopting, setIsAdopting] = useState<boolean>(initial.pets.length === 0);
+  const [showGuide, setShowGuide] = useState<boolean>(false);
   const [simSpeed, setSimSpeed] = useState<0 | 1 | 2>(1);
-  const [cooldowns, setCooldowns] = useState<Record<string, number>>({});
-  const [activeEffect, setActiveEffect] = useState<{
-    id: number;
-    type: ActionEffectType;
-    emoji: string;
-  } | null>(null);
+  const [toasts, setToasts] = useState<ToastItem[]>([]);
+  const [needsCollapsed, setNeedsCollapsed] = useState<boolean>(false);
 
-  const effectTimerRef = useRef<number | null>(null);
+  const canvasHandleRef = useRef<GameCanvasHandle | null>(null);
+  const cooldownsRef = useRef<Record<string, number>>({});
 
-  // Persist to localStorage
+  // Persist state
   useEffect(() => {
     try {
-      const payload: SavedState = { pets, activePetId };
+      const payload: SavedState = { pets, activePetId, gender };
       localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
     } catch {
-      // Ignore storage quota errors
+      // ignore storage errors
     }
-  }, [pets, activePetId]);
+  }, [pets, activePetId, gender]);
 
-  // Trigger visual reaction burst on the pet stage
-  const triggerEffect = useCallback((type: ActionEffectType, emoji: string) => {
-    if (effectTimerRef.current) {
-      window.clearTimeout(effectTimerRef.current);
-    }
-    setActiveEffect({ id: Date.now(), type, emoji });
-    effectTimerRef.current = window.setTimeout(() => {
-      setActiveEffect(null);
-    }, 950);
+  const pushToast = useCallback((text: string, tone: ToastItem['tone'] = 'default') => {
+    const id = Date.now() + Math.random();
+    setToasts((prev) => [...prev.slice(-2), { id, text, tone }]);
+    window.setTimeout(() => {
+      setToasts((prev) => prev.filter((t) => t.id !== id));
+    }, 3200);
   }, []);
 
-  // Simulation loop: 1-second tick for needs decay & cooldowns
+  // 1-second simulation tick for species-specific needs decay
   useEffect(() => {
-    const interval = window.setInterval(() => {
-      // Always tick cooldowns down
-      setCooldowns((prev) => {
-        const keys = Object.keys(prev);
-        if (keys.length === 0) return prev;
-        const next: Record<string, number> = {};
-        let changed = false;
-        for (const k of keys) {
-          const remaining = prev[k] - 1;
-          if (remaining > 0) {
-            next[k] = remaining;
-          }
-          changed = true;
-        }
-        return changed ? next : prev;
-      });
+    const timer = window.setInterval(() => {
+      // Tick cooldowns
+      const cds = cooldownsRef.current;
+      for (const k of Object.keys(cds)) {
+        cds[k] -= 1;
+        if (cds[k] <= 0) delete cds[k];
+      }
 
-      if (simSpeed === 0 || isAdopting) return;
+      if (simSpeed === 0 || isAdopting || showGuide) return;
 
-      setPets((prevPets) =>
-        prevPets.map((pet) => {
-          const species = SPECIES_MAP[pet.speciesId];
-          if (!species) return pet;
-          // Active pet decays at selected speed; background sanctuary pets decay gently (0.25x)
-          const factor = pet.id === activePetId ? simSpeed : simSpeed * 0.25;
+      setPets((prev) =>
+        prev.map((pet) => {
+          const sp = SPECIES_MAP[pet.speciesId];
+          if (!sp) return pet;
+          const factor = pet.id === activePetId ? simSpeed : simSpeed * 0.2;
           const nextNeeds: Record<string, number> = { ...pet.needs };
-          for (const needDef of species.needs) {
-            const current = nextNeeds[needDef.id] ?? 100;
-            nextNeeds[needDef.id] = clamp(current - needDef.decayPerSecond * factor);
+          for (const n of sp.needs) {
+            const cur = nextNeeds[n.id] ?? 100;
+            nextNeeds[n.id] = clamp(cur - n.decayPerSecond * factor);
           }
           return {
             ...pet,
             needs: nextNeeds,
-            ageDays: pet.ageDays + (0.008 * factor),
+            ageDays: pet.ageDays + 0.008 * factor,
           };
         })
       );
     }, 1000);
-
-    return () => window.clearInterval(interval);
-  }, [simSpeed, activePetId, isAdopting]);
+    return () => window.clearInterval(timer);
+  }, [simSpeed, activePetId, isAdopting, showGuide]);
 
   const handleAdopt = (speciesId: SpeciesId, name: string) => {
     const species = SPECIES_MAP[speciesId];
     if (!species) return;
 
-    // Initialize all species-specific needs between 74% and 92% so the player has immediate fun things to try
     const startingNeeds: Record<string, number> = {};
     species.needs.forEach((n, idx) => {
-      startingNeeds[n.id] = 74 + ((idx * 7) % 19);
+      startingNeeds[n.id] = 68 + ((idx * 7) % 21);
     });
 
     const newPet: PetInstance = {
-      id: `pet_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      id: `pet_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
       name,
       speciesId,
       adoptedAt: Date.now(),
@@ -136,172 +144,287 @@ export const App: React.FC = () => {
       bondXp: 10,
       actionsCompleted: 0,
       ageDays: 0,
-      log: [
-        {
-          id: `log_${Date.now()}`,
-          timestamp: Date.now(),
-          emoji: '🏡',
-          message: `Welcomed ${name} the ${species.name} to the ${species.habitatName}!`,
-          category: 'milestone',
-        },
-      ],
+      log: [],
     };
 
     setPets((prev) => [...prev, newPet]);
     setActivePetId(newPet.id);
     setIsAdopting(false);
-    setCooldowns({});
+    cooldownsRef.current = {};
+    pushToast(`🏡 Welcome home, ${name} the ${species.name}!`, 'success');
   };
 
-  const handlePerformAction = (need: NeedDefinition) => {
-    if (!activePetId) return;
-    if ((cooldowns[need.id] ?? 0) > 0) return;
+  const handlePerformNeedAction = useCallback(
+    (need: NeedDefinition): boolean => {
+      if (!activePetId) return false;
+      if ((cooldownsRef.current[need.id] ?? 0) > 0) return false;
 
-    setCooldowns((prev) => ({ ...prev, [need.id]: need.cooldownSeconds }));
-    triggerEffect(need.effectType, need.emoji);
+      cooldownsRef.current[need.id] = need.cooldownSeconds;
 
-    setPets((prevPets) =>
-      prevPets.map((pet) => {
-        if (pet.id !== activePetId) return pet;
-        const nextNeeds: Record<string, number> = { ...pet.needs };
-        const before = nextNeeds[need.id] ?? 50;
-        nextNeeds[need.id] = clamp(before + need.restoreAmount);
+      let petNameForToast = '';
+      setPets((prev) =>
+        prev.map((pet) => {
+          if (pet.id !== activePetId) return pet;
+          petNameForToast = pet.name;
+          const nextNeeds: Record<string, number> = { ...pet.needs };
+          const before = nextNeeds[need.id] ?? 50;
+          nextNeeds[need.id] = clamp(before + need.restoreAmount);
 
-        if (need.sideEffects) {
-          for (const [targetId, delta] of Object.entries(need.sideEffects)) {
-            if (targetId in nextNeeds) {
-              nextNeeds[targetId] = clamp(nextNeeds[targetId] + delta);
+          if (need.sideEffects) {
+            for (const [targetId, delta] of Object.entries(need.sideEffects)) {
+              if (targetId in nextNeeds) {
+                nextNeeds[targetId] = clamp(nextNeeds[targetId] + delta);
+              }
             }
           }
-        }
 
-        const xpGain = before < 50 ? 18 : 12;
-        const newLogEntry = {
-          id: `log_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`,
-          timestamp: Date.now(),
-          emoji: need.emoji,
-          message: `${pet.name} ${need.actionMessage}`,
-          category: need.category,
-        };
+          return {
+            ...pet,
+            needs: nextNeeds,
+            bondXp: pet.bondXp + (before < 50 ? 18 : 12),
+            actionsCompleted: pet.actionsCompleted + 1,
+          };
+        })
+      );
 
-        return {
-          ...pet,
-          needs: nextNeeds,
-          bondXp: pet.bondXp + xpGain,
-          actionsCompleted: pet.actionsCompleted + 1,
-          log: [newLogEntry, ...pet.log].slice(0, 20),
-        };
-      })
-    );
-  };
-
-  const handlePetClick = () => {
-    if (!activePetId) return;
-    triggerEffect('love', '❤️');
-
-    setPets((prevPets) =>
-      prevPets.map((pet) => {
-        if (pet.id !== activePetId) return pet;
-        const species = SPECIES_MAP[pet.speciesId];
-        if (!species) return pet;
-        // Boost the last play need (usually social/affection) slightly
-        const playNeeds = species.needs.filter((n) => n.category === 'play');
-        const socialNeed = playNeeds[playNeeds.length - 1];
-        const nextNeeds = { ...pet.needs };
-        if (socialNeed) {
-          nextNeeds[socialNeed.id] = clamp((nextNeeds[socialNeed.id] ?? 50) + 5);
-        }
-        return {
-          ...pet,
-          needs: nextNeeds,
-          bondXp: pet.bondXp + 3,
-        };
-      })
-    );
-  };
-
-  const handleReleasePet = (petId: string) => {
-    setPets((prev) => {
-      const remaining = prev.filter((p) => p.id !== petId);
-      if (remaining.length === 0) {
-        setActivePetId(null);
-        setIsAdopting(true);
-      } else if (activePetId === petId) {
-        setActivePetId(remaining[0].id);
+      if (petNameForToast) {
+        pushToast(`${need.emoji} ${petNameForToast} ${need.actionMessage}`, 'success');
       }
-      return remaining;
-    });
-  };
+      return true;
+    },
+    [activePetId, pushToast]
+  );
+
+  const handlePetAffection = useCallback(() => {
+    if (!activePetId) return;
+    setPets((prev) =>
+      prev.map((pet) => {
+        if (pet.id !== activePetId) return pet;
+        const sp = SPECIES_MAP[pet.speciesId];
+        if (!sp) return pet;
+        const playNeeds = sp.needs.filter((n) => n.category === 'play');
+        const social = playNeeds[playNeeds.length - 1];
+        const nextNeeds = { ...pet.needs };
+        if (social) {
+          nextNeeds[social.id] = clamp((nextNeeds[social.id] ?? 50) + 6);
+        }
+        return {
+          ...pet,
+          needs: nextNeeds,
+          bondXp: pet.bondXp + 4,
+        };
+      })
+    );
+  }, [activePetId]);
 
   const activePet = pets.find((p) => p.id === activePetId) ?? null;
   const activeSpecies = activePet ? SPECIES_MAP[activePet.speciesId] : null;
 
+  const wellness = useMemo(() => {
+    if (!activePet || !activeSpecies) return 100;
+    const sum = activeSpecies.needs.reduce((acc, n) => acc + (activePet.needs[n.id] ?? 100), 0);
+    return Math.round(sum / activeSpecies.needs.length);
+  }, [activePet, activeSpecies]);
+
+  const bond = useMemo(
+    () => getBondLevel(activePet?.bondXp ?? 0),
+    [activePet?.bondXp]
+  );
+
+  const cycleSpeed = () => {
+    setSimSpeed((prev) => (prev === 1 ? 2 : prev === 2 ? 0 : 1));
+  };
+
   return (
-    <div className="app-shell">
-      {!isAdopting && activePet && activeSpecies && (
-        <nav className="top-nav" aria-label="Sanctuary Navigation">
-          <div className="brand">
-            <div className="brand-icon">
-              <PawPrint size={20} />
-            </div>
-            <span>Paws &amp; Claws</span>
+    <div id="app">
+      {/* Top 60px HUD Bar (slime-store design language) */}
+      <header id="hud">
+        <div className="hud-left">
+          <div className="brand-badge">
+            <span className="brand-dot" />
+            <span className="brand-title">Paws &amp; Claws</span>
           </div>
 
-          <div className="pet-switcher">
-            {pets.map((p) => {
-              const sp = SPECIES_MAP[p.speciesId];
-              const isCurrent = p.id === activePet.id;
-              return (
-                <button
-                  key={p.id}
-                  type="button"
-                  className={`pet-tab ${isCurrent ? 'active' : ''}`}
-                  style={{ '--accent': sp?.accentColor ?? '#10b981' } as React.CSSProperties}
-                  onClick={() => {
-                    setActivePetId(p.id);
-                    setCooldowns({});
-                  }}
-                >
-                  <span className="pet-tab-dot" />
-                  <span>{p.name}</span>
-                  <small>{sp?.name.split(' ').pop()}</small>
-                </button>
-              );
-            })}
+          {pets.length > 0 && (
+            <div className="pet-pills">
+              {pets.map((p) => {
+                const sp = SPECIES_MAP[p.speciesId];
+                const isCur = p.id === activePetId;
+                return (
+                  <button
+                    key={p.id}
+                    type="button"
+                    className={`hud-btn pet-switch-btn ${isCur ? 'active-pet' : ''}`}
+                    onClick={() => {
+                      setActivePetId(p.id);
+                      cooldownsRef.current = {};
+                    }}
+                  >
+                    {p.name} <small>({sp?.name.split(' ').pop()})</small>
+                  </button>
+                );
+              })}
+            </div>
+          )}
 
+          {activePet && (
+            <>
+              <div className="stat-pill">
+                <span className="stat-label">Wellness</span>
+                <span
+                  className="stat-value"
+                  style={{ color: wellness >= 65 ? '#15803d' : wellness >= 35 ? '#b45309' : '#dc2626' }}
+                >
+                  {wellness}%
+                </span>
+              </div>
+              <div className="stat-pill">
+                <span className="stat-label">Bond</span>
+                <span className="stat-value">
+                  Lv.{bond.level} {bond.title}
+                </span>
+              </div>
+            </>
+          )}
+        </div>
+
+        <div className="hud-right">
+          {activeSpecies && (
             <button
               type="button"
-              className="btn-adopt-another"
-              onClick={() => setIsAdopting(true)}
+              className="hud-btn"
+              onClick={() => setShowGuide(true)}
             >
-              <Plus size={16} />
-              Adopt Pet
+              <BookOpen size={14} /> Care Guide
             </button>
-          </div>
-        </nav>
+          )}
+
+          <button
+            type="button"
+            className="hud-btn"
+            onClick={cycleSpeed}
+            title="Toggle simulation speed"
+          >
+            {simSpeed === 0 ? (
+              <>
+                <Pause size={14} /> Paused
+              </>
+            ) : simSpeed === 1 ? (
+              <>
+                <Play size={14} /> 1x
+              </>
+            ) : (
+              <>
+                <FastForward size={14} /> 2x
+              </>
+            )}
+          </button>
+
+          <button
+            type="button"
+            className="hud-btn"
+            onClick={() => setGender((g) => (g === 'female' ? 'male' : 'female'))}
+            title="Switch Caregiver Character"
+          >
+            <User size={14} /> {gender === 'female' ? 'Girl' : 'Boy'}
+          </button>
+
+          <button
+            type="button"
+            className="hud-btn primary-btn"
+            onClick={() => setIsAdopting(true)}
+          >
+            <Plus size={14} /> Adopt Pet
+          </button>
+        </div>
+      </header>
+
+      {/* Full-Screen 45-Degree World Viewport */}
+      <div className="world-stage-shell">
+        {activePet && activeSpecies ? (
+          <>
+            <GameCanvas
+              ref={canvasHandleRef}
+              pet={activePet}
+              species={activeSpecies}
+              gender={gender}
+              disabled={isAdopting || showGuide}
+              onPerformNeedAction={handlePerformNeedAction}
+              onPetAffection={handlePetAffection}
+            />
+
+            {/* Floating Compact Needs Dock (Click any need to walk right to its station!) */}
+            <aside className={`needs-dock ${needsCollapsed ? 'collapsed' : ''}`}>
+              <button
+                type="button"
+                className="needs-dock-header"
+                onClick={() => setNeedsCollapsed((c) => !c)}
+              >
+                <span>
+                  {activeSpecies.name} Needs ({activeSpecies.needs.length})
+                </span>
+                <span className="dock-toggle">{needsCollapsed ? '▸' : '▾'}</span>
+              </button>
+
+              {!needsCollapsed && (
+                <div className="needs-dock-list">
+                  {activeSpecies.needs.map((need) => {
+                    const val = Math.round(activePet.needs[need.id] ?? 100);
+                    const color = val >= 65 ? '#16a34a' : val >= 35 ? '#f59e0b' : '#ef4444';
+                    return (
+                      <button
+                        key={need.id}
+                        type="button"
+                        className={`dock-need-row ${val < 35 ? 'urgent' : ''}`}
+                        onClick={() => canvasHandleRef.current?.walkToStation(need.stationSlot)}
+                        title={`Walk to ${need.stationTitle}`}
+                      >
+                        <span className="dock-emoji">{need.emoji}</span>
+                        <div className="dock-info">
+                          <div className="dock-label-line">
+                            <span>{need.label}</span>
+                            <strong style={{ color }}>{val}%</strong>
+                          </div>
+                          <div className="dock-bar">
+                            <div style={{ width: `${Math.max(3, val)}%`, background: color }} />
+                          </div>
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </aside>
+          </>
+        ) : (
+          <div className="empty-backdrop" />
+        )}
+
+        {/* Top-Right Floating Toasts (slime-store cue) */}
+        <div id="toast-container">
+          {toasts.map((t) => (
+            <div key={t.id} className={`toast ${t.tone}`}>
+              {t.text}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Adoption Modal */}
+      {isAdopting && (
+        <AdoptionScreen
+          gender={gender}
+          onChangeGender={setGender}
+          onAdopt={handleAdopt}
+          canCancel={pets.length > 0}
+          onCancel={() => setIsAdopting(false)}
+        />
       )}
 
-      <main className="main-content">
-        {isAdopting || !activePet || !activeSpecies ? (
-          <AdoptionScreen
-            onAdopt={handleAdopt}
-            canCancel={pets.length > 0}
-            onCancel={() => setIsAdopting(false)}
-          />
-        ) : (
-          <CareDashboard
-            pet={activePet}
-            species={activeSpecies}
-            simSpeed={simSpeed}
-            onChangeSimSpeed={setSimSpeed}
-            cooldowns={cooldowns}
-            onPerformAction={handlePerformAction}
-            onPetClick={handlePetClick}
-            onReleasePet={handleReleasePet}
-            activeEffect={activeEffect}
-          />
-        )}
-      </main>
+      {/* Care Guide Modal */}
+      {showGuide && activeSpecies && (
+        <CareGuideModal species={activeSpecies} onClose={() => setShowGuide(false)} />
+      )}
     </div>
   );
 };

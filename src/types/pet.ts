@@ -12,6 +12,37 @@ export type Difficulty = 'Easy' | 'Moderate' | 'Specialist';
 
 export type PetMood = 'thriving' | 'happy' | 'needs_care' | 'urgent';
 
+export type PlayerGender = 'female' | 'male';
+
+export type Facing = 'up' | 'down' | 'left' | 'right';
+
+export type StationSlotId =
+  | 'indoor_food'
+  | 'indoor_water'
+  | 'indoor_care'
+  | 'indoor_hygiene'
+  | 'indoor_play'
+  | 'outdoor_1'
+  | 'outdoor_2';
+
+export type StationVisualKind =
+  | 'food_bowl'
+  | 'water_bowl'
+  | 'fountain'
+  | 'mist_terrarium'
+  | 'uvb_lamp'
+  | 'grooming_table'
+  | 'litter_box'
+  | 'soak_pool'
+  | 'hay_rack'
+  | 'cozy_rug'
+  | 'bird_perch'
+  | 'potty_lawn'
+  | 'walk_fetch'
+  | 'scratch_post'
+  | 'climb_play'
+  | 'ball_yard';
+
 export type ActionEffectType =
   | 'food'
   | 'water'
@@ -26,17 +57,20 @@ export interface NeedDefinition {
   label: string;
   category: NeedCategory;
   emoji: string;
-  /** Points lost per simulated minute at 1x speed */
+  stationSlot: StationSlotId;
+  stationTitle: string;
+  stationVisual: StationVisualKind;
+  /** Points lost per simulated second at 1x speed */
   decayPerSecond: number;
-  /** Label for the button that satisfies this need */
+  /** Label for the action that satisfies this need */
   actionLabel: string;
-  /** Short flavor text shown in activity log */
+  /** Short flavor text shown in toast/log */
   actionMessage: string;
   /** Amount restored when the action is performed (0-100 scale) */
   restoreAmount: number;
-  /** Secondary side effects on other needs (optional, e.g., walk slightly lowers hydration) */
+  /** Secondary side effects on other needs */
   sideEffects?: Record<string, number>;
-  /** Cooldown in seconds before the action can be clicked again */
+  /** Cooldown in seconds before the action can be performed again */
   cooldownSeconds: number;
   /** Visual particle effect type */
   effectType: ActionEffectType;
@@ -54,9 +88,7 @@ export interface SpeciesProfile {
   accentColor: string;
   softBg: string;
   suggestedNames: string[];
-  /** Fun biology/care summary shown in the Care Guide */
   overview: string;
-  /** All biological and play needs dynamically loaded for this species */
   needs: NeedDefinition[];
 }
 
@@ -73,14 +105,9 @@ export interface PetInstance {
   name: string;
   speciesId: SpeciesId;
   adoptedAt: number;
-  /** Current value (0 to 100) for every need id defined by the pet's species */
   needs: Record<string, number>;
-  /** Total care XP earned — drives bond level */
   bondXp: number;
-  /** Total care actions completed */
   actionsCompleted: number;
-  /** Simulated age in days */
   ageDays: number;
-  /** Recent activity history */
   log: ActivityLogEntry[];
 }
